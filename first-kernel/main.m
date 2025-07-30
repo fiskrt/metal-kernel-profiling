@@ -337,11 +337,15 @@ void runloopkernel_single_encoder(int n) {
             uint *outBufData = (uint*)outBuf.contents;
             NSLog(@"Final results (first 10 elements):");
             for (int i = 0; i < MIN(10, bufferSize); i++) {
-                NSLog(@"Input: %u -> Output: %u (should be %u² + 10 = %u)",
-                      inBufData[i],
-                      outBufData[i],
-                      inBufData[i],
-                      inBufData[i] * inBufData[i] + 10);
+                
+                if (i < 10){
+                    NSLog(@"Input: %u -> Output: %u (should be %u² + 10 = %u)",
+                          inBufData[i],
+                          outBufData[i],
+                          inBufData[i],
+                          inBufData[i] * inBufData[i] + 10);
+                }
+                assert(outBufData[i] == inBufData[i] * inBufData[i] + 10);
             }
         }
     }
@@ -349,9 +353,136 @@ void runloopkernel_single_encoder(int n) {
     [captureManager stopCapture];
 }
 
+// CPU reference implementation for matrix multiplication verification
+void cpu_matmul(const float* A, const float* B, float* C, int m, int k, int n) {
+    for (int i = 0; i < m; i++) {
+        for (int j = 0; j < n; j++) {
+            float sum = 0.0f;
+            for (int kp = 0; kp < k; kp++) {
+                sum += A[i*k + kp] * B[kp*n + j];
+            }
+            C[i*n + j] = sum;
+        }
+    }
+}
+
+// Test matrix multiplication kernel with correctness verification
+void test_matmul() {
+    NSLog(@"Testing matrix multiplication kernel...");
+    
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    id<MTLLibrary> defaultLibrary = [device newDefaultLibrary];
+    id<MTLCommandQueue> commandQueue = [device newCommandQueue];
+    
+    // Small test matrices for verification
+    int m = 4, k = 3, n = 5;  // A(4x3) × B(3x5) = C(4x5)
+    int sizeA = m * k * sizeof(float);
+    int sizeB = k * n * sizeof(float);
+    int sizeC = m * n * sizeof(float);
+    
+    // Create Metal buffers
+    id<MTLBuffer> bufA = [device newBufferWithLength:sizeA options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bufB = [device newBufferWithLength:sizeB options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bufC = [device newBufferWithLength:sizeC options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bufM = [device newBufferWithLength:sizeof(int) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bufK = [device newBufferWithLength:sizeof(int) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bufN = [device newBufferWithLength:sizeof(int) options:MTLResourceStorageModeShared];
+    
+    // Initialize test data
+    float* A = (float*)bufA.contents;
+    float* B = (float*)bufB.contents;
+    float* C = (float*)bufC.contents;
+    
+    for (int i = 0; i < m*k; i++) {
+        A[i] = i + 1.0f;
+    }
+    for (int i = 0; i < k*n; i++) {
+        B[i] = (i + 1) * 0.1f;
+    }
+    
+    // Set dimensions
+    *(int*)bufM.contents = m;
+    *(int*)bufK.contents = k;
+    *(int*)bufN.contents = n;
+    
+    // CPU reference calculation
+    float* C_ref = malloc(sizeC);
+    cpu_matmul(A, B, C_ref, m, k, n);
+    
+    NSLog(@"Input A (4x3):");
+    for (int i = 0; i < m; i++) {
+        NSString* row = @"";
+        for (int j = 0; j < k; j++) {
+            row = [row stringByAppendingFormat:@"%.1f ", A[i*k + j]];
+        }
+        NSLog(@"%@", row);
+    }
+    
+    NSLog(@"Input B (3x5):");
+    for (int i = 0; i < k; i++) {
+        NSString* row = @"";
+        for (int j = 0; j < n; j++) {
+            row = [row stringByAppendingFormat:@"%.1f ", B[i*n + j]];
+        }
+        NSLog(@"%@", row);
+    }
+    
+    // GPU computation
+    NSError *error = nil;
+    id<MTLFunction> matmulFunc = [defaultLibrary newFunctionWithName:@"filip_matmul"];
+    id<MTLComputePipelineState> matmulPSO = [device newComputePipelineStateWithFunction:matmulFunc error:&error];
+    
+    if (error) {
+        NSLog(@"Failed to create pipeline state: %@", error);
+        free(C_ref);
+        return;
+    }
+    
+    id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+    id<MTLComputeCommandEncoder> computeEncoder = [commandBuffer computeCommandEncoder];
+    
+    [computeEncoder setComputePipelineState:matmulPSO];
+    [computeEncoder setBuffer:bufA offset:0 atIndex:0];
+    [computeEncoder setBuffer:bufB offset:0 atIndex:1];
+    [computeEncoder setBuffer:bufC offset:0 atIndex:2];
+    [computeEncoder setBuffer:bufM offset:0 atIndex:3];
+    [computeEncoder setBuffer:bufK offset:0 atIndex:4];
+    [computeEncoder setBuffer:bufN offset:0 atIndex:5];
+    
+    // 2D dispatch: (n, m) threads
+    MTLSize threadsPerGrid = MTLSizeMake(n, m, 1);
+    NSUInteger threadgroupWidth = MIN(matmulPSO.threadExecutionWidth, n);
+    NSUInteger threadgroupHeight = MIN(matmulPSO.maxTotalThreadsPerThreadgroup / threadgroupWidth, m);
+    MTLSize threadsPerThreadgroup = MTLSizeMake(threadgroupWidth, threadgroupHeight, 1);
+    
+    [computeEncoder dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+    [computeEncoder endEncoding];
+    
+    [commandBuffer commit];
+    [commandBuffer waitUntilCompleted];
+    
+    
+    bool correct = true;
+    float tolerance = 1e-5f;
+    for (int i = 0; i < m*n; i++) {
+        if (fabs(C[i] - C_ref[i]) > tolerance) {
+            NSLog(@"Mismatch at index %d: GPU=%.6f, CPU=%.6f", i, C[i], C_ref[i]);
+            correct = false;
+        }
+    }
+    
+    if (correct) {
+        NSLog(@"✅ Matrix multiplication test PASSED!");
+    } else {
+        NSLog(@"❌ Matrix multiplication test FAILED!");
+    }
+    
+    free(C_ref);
+}
+
 int main(int argc, const char * argv[]) {
     @autoreleasepool {
-        runloopkernel_single_encoder(5);
+        test_matmul();
     }
     return 0;
 }
