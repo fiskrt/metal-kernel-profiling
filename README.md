@@ -11,13 +11,19 @@ captureDescriptor.destination = MTLCaptureDestinationDeveloperTools;
 [captureManager stopCapture];
 ```
 
-## Command Line Profiling
-Set environment variable:
+## To allow `MTLCaptureManager` we must set 
 ```bash
 MTL_CAPTURE_ENABLED=1
 ```
 
-## View Results
-- Open Xcode → Window → Developer Tools → GPU Frame Debugger
-- Analyze GPU timeline, memory usage, and kernel performance
-- View shader assembly and register usage
+[profiler](imgs/profiler.png)
+
+Example output from `test_matmul_with_profiling(false)`:
+```
+Performance Results:
+(1000 x 3000) * (3000 x 1000) = (1000 x 1000):
+CPU Time: 4432.869 ms
+GPU Time: 32.426 ms
+Speedup: 136.71x
+✅ Matrix multiplication test PASSED!
+```
