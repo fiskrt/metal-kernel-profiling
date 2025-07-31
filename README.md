@@ -1,5 +1,7 @@
 # Metal GPU Profiling
 
+![profiler](imgs/profiler.png)
+
 ## GPU Frame Capture
 ```objc
 MTLCaptureManager *captureManager = [MTLCaptureManager sharedCaptureManager];
@@ -11,12 +13,11 @@ captureDescriptor.destination = MTLCaptureDestinationDeveloperTools;
 [captureManager stopCapture];
 ```
 
-## To allow `MTLCaptureManager` we must set 
+### To allow `MTLCaptureManager` we must set 
 ```bash
 MTL_CAPTURE_ENABLED=1
 ```
 
-[profiler](imgs/profiler.png)
 
 Example output from `test_matmul_with_profiling(false)`:
 ```
