@@ -366,21 +366,19 @@ void cpu_matmul(const float* A, const float* B, float* C, int m, int k, int n) {
     }
 }
 
-// Test matrix multiplication kernel with correctness verification
+// Speed up if we hold M and N fixed. Doubling K, doubles the speedup
+// k=500 35x k=1000 70x k=2000 140x
 void test_matmul() {
-    NSLog(@"Testing matrix multiplication kernel...");
-    
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     id<MTLLibrary> defaultLibrary = [device newDefaultLibrary];
     id<MTLCommandQueue> commandQueue = [device newCommandQueue];
     
-    // Small test matrices for verification
-    int m = 4, k = 3, n = 5;  // A(4x3) × B(3x5) = C(4x5)
+    int m = 1000, k = 3000, n = 1000;
     int sizeA = m * k * sizeof(float);
     int sizeB = k * n * sizeof(float);
     int sizeC = m * n * sizeof(float);
     
-    // Create Metal buffers
+    // Create Metal buffers (they auto free themselves when lifetime is over)
     id<MTLBuffer> bufA = [device newBufferWithLength:sizeA options:MTLResourceStorageModeShared];
     id<MTLBuffer> bufB = [device newBufferWithLength:sizeB options:MTLResourceStorageModeShared];
     id<MTLBuffer> bufC = [device newBufferWithLength:sizeC options:MTLResourceStorageModeShared];
@@ -388,11 +386,10 @@ void test_matmul() {
     id<MTLBuffer> bufK = [device newBufferWithLength:sizeof(int) options:MTLResourceStorageModeShared];
     id<MTLBuffer> bufN = [device newBufferWithLength:sizeof(int) options:MTLResourceStorageModeShared];
     
-    // Initialize test data
+    // Initialize buffers, .contents is a CPU pointer to buffers.
     float* A = (float*)bufA.contents;
     float* B = (float*)bufB.contents;
     float* C = (float*)bufC.contents;
-    
     for (int i = 0; i < m*k; i++) {
         A[i] = i + 1.0f;
     }
@@ -400,32 +397,16 @@ void test_matmul() {
         B[i] = (i + 1) * 0.1f;
     }
     
-    // Set dimensions
     *(int*)bufM.contents = m;
     *(int*)bufK.contents = k;
     *(int*)bufN.contents = n;
     
-    // CPU reference calculation
+    // CPU reference calculation with timing
     float* C_ref = malloc(sizeC);
+    CFAbsoluteTime cpuStart = CFAbsoluteTimeGetCurrent();
     cpu_matmul(A, B, C_ref, m, k, n);
-    
-    NSLog(@"Input A (4x3):");
-    for (int i = 0; i < m; i++) {
-        NSString* row = @"";
-        for (int j = 0; j < k; j++) {
-            row = [row stringByAppendingFormat:@"%.1f ", A[i*k + j]];
-        }
-        NSLog(@"%@", row);
-    }
-    
-    NSLog(@"Input B (3x5):");
-    for (int i = 0; i < k; i++) {
-        NSString* row = @"";
-        for (int j = 0; j < n; j++) {
-            row = [row stringByAppendingFormat:@"%.1f ", B[i*n + j]];
-        }
-        NSLog(@"%@", row);
-    }
+    CFAbsoluteTime cpuEnd = CFAbsoluteTimeGetCurrent();
+    double cpuTime = (cpuEnd - cpuStart) * 1000.0; // Convert to milliseconds
     
     // GPU computation
     NSError *error = nil;
@@ -458,8 +439,11 @@ void test_matmul() {
     [computeEncoder dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
     [computeEncoder endEncoding];
     
+    CFAbsoluteTime gpuStart = CFAbsoluteTimeGetCurrent();
     [commandBuffer commit];
     [commandBuffer waitUntilCompleted];
+    CFAbsoluteTime gpuEnd = CFAbsoluteTimeGetCurrent();
+    double gpuTime = (gpuEnd - gpuStart) * 1000.0; // Convert to milliseconds
     
     
     bool correct = true;
@@ -470,6 +454,11 @@ void test_matmul() {
             correct = false;
         }
     }
+    
+    NSLog(@"Performance Results:");
+    NSLog(@"CPU Time: %.3f ms", cpuTime);
+    NSLog(@"GPU Time: %.3f ms", gpuTime);
+    NSLog(@"Speedup: %.2fx", cpuTime / gpuTime);
     
     if (correct) {
         NSLog(@"✅ Matrix multiplication test PASSED!");
