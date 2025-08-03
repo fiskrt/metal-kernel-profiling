@@ -360,6 +360,7 @@ void cpu_matmul(const float* A, const float* B, float* C, int m, int k, int n) {
             float sum = 0.0f;
             for (int kp = 0; kp < k; kp++) {
                 sum += A[i*k + kp] * B[kp*n + j];
+                // transposed assume
             }
             C[i*n + j] = sum;
         }
@@ -368,17 +369,17 @@ void cpu_matmul(const float* A, const float* B, float* C, int m, int k, int n) {
 
 // Speed up if we hold M and N fixed. Doubling K, doubles the speedup
 // k=500 35x k=1000 70x k=2000 140x
-void test_matmul() {
+void test_matmul_with_profiling(bool enableProfiling, int m, int k, int n) {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     id<MTLLibrary> defaultLibrary = [device newDefaultLibrary];
     id<MTLCommandQueue> commandQueue = [device newCommandQueue];
     
-    int m = 1000, k = 3000, n = 1000;
     int sizeA = m * k * sizeof(float);
     int sizeB = k * n * sizeof(float);
     int sizeC = m * n * sizeof(float);
     
     // Create Metal buffers (they auto free themselves when lifetime is over)
+    // ALSO: using Shared mode such that cpu and gpu share the memory
     id<MTLBuffer> bufA = [device newBufferWithLength:sizeA options:MTLResourceStorageModeShared];
     id<MTLBuffer> bufB = [device newBufferWithLength:sizeB options:MTLResourceStorageModeShared];
     id<MTLBuffer> bufC = [device newBufferWithLength:sizeC options:MTLResourceStorageModeShared];
@@ -391,15 +392,31 @@ void test_matmul() {
     float* B = (float*)bufB.contents;
     float* C = (float*)bufC.contents;
     for (int i = 0; i < m*k; i++) {
-        A[i] = i + 1.0f;
+        A[i] = 2*(float)drand48();
     }
     for (int i = 0; i < k*n; i++) {
-        B[i] = (i + 1) * 0.1f;
+        B[i] = 2*(float)drand48();
     }
     
     *(int*)bufM.contents = m;
     *(int*)bufK.contents = k;
     *(int*)bufN.contents = n;
+    
+    // Setup profiling if enabled
+    MTLCaptureManager *captureManager = nil;
+    if (enableProfiling) {
+        captureManager = [MTLCaptureManager sharedCaptureManager];
+        MTLCaptureDescriptor *captureDescriptor = [[MTLCaptureDescriptor alloc] init];
+        captureDescriptor.captureObject = device;
+        captureDescriptor.destination = MTLCaptureDestinationDeveloperTools;
+        
+        NSError *captureError = nil;
+        if (![captureManager startCaptureWithDescriptor:captureDescriptor error:&captureError]) {
+            NSLog(@"Failed to start GPU capture: %@", captureError);
+        } else {
+            NSLog(@"GPU profiling started - check Xcode GPU debugger");
+        }
+    }
     
     // CPU reference calculation with timing
     float* C_ref = malloc(sizeC);
@@ -410,7 +427,8 @@ void test_matmul() {
     
     // GPU computation
     NSError *error = nil;
-    id<MTLFunction> matmulFunc = [defaultLibrary newFunctionWithName:@"filip_matmul"];
+    NSString *kernel_name = @"filip_matmul_o1";
+    id<MTLFunction> matmulFunc = [defaultLibrary newFunctionWithName:kernel_name];
     id<MTLComputePipelineState> matmulPSO = [device newComputePipelineStateWithFunction:matmulFunc error:&error];
     
     if (error) {
@@ -429,14 +447,25 @@ void test_matmul() {
     [computeEncoder setBuffer:bufM offset:0 atIndex:3];
     [computeEncoder setBuffer:bufK offset:0 atIndex:4];
     [computeEncoder setBuffer:bufN offset:0 atIndex:5];
-    
-    // 2D dispatch: (n, m) threads
-    MTLSize threadsPerGrid = MTLSizeMake(n, m, 1);
-    NSUInteger threadgroupWidth = MIN(matmulPSO.threadExecutionWidth, n);
-    NSUInteger threadgroupHeight = MIN(matmulPSO.maxTotalThreadsPerThreadgroup / threadgroupWidth, m);
-    MTLSize threadsPerThreadgroup = MTLSizeMake(threadgroupWidth, threadgroupHeight, 1);
-    
-    [computeEncoder dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+        
+    if ([kernel_name containsString:@"o1"]){
+        int tileSize = 16;
+        MTLSize threadgroupSize = MTLSizeMake(tileSize, tileSize, 1);
+        // Calculate grid size (number of threadgroups)
+        NSUInteger gridWidth = (n + tileSize - 1) / tileSize;
+        NSUInteger gridHeight = (m + tileSize - 1) / tileSize;
+        MTLSize gridSize = MTLSizeMake(gridWidth, gridHeight, 1);
+        NSLog(@"Running o1!");
+        [computeEncoder dispatchThreadgroups:gridSize threadsPerThreadgroup:threadgroupSize];
+    } else {
+        // 2D dispatch: (n, m) threads
+        MTLSize threadsPerGrid = MTLSizeMake(n, m, 1);
+        NSUInteger threadgroupWidth = MIN(matmulPSO.threadExecutionWidth, n);
+        NSUInteger threadgroupHeight = MIN(matmulPSO.maxTotalThreadsPerThreadgroup / threadgroupWidth, m);
+        MTLSize threadsPerThreadgroup = MTLSizeMake(threadgroupWidth, threadgroupHeight, 1);
+        [computeEncoder dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+    }
+
     [computeEncoder endEncoding];
     
     CFAbsoluteTime gpuStart = CFAbsoluteTimeGetCurrent();
@@ -445,6 +474,10 @@ void test_matmul() {
     CFAbsoluteTime gpuEnd = CFAbsoluteTimeGetCurrent();
     double gpuTime = (gpuEnd - gpuStart) * 1000.0; // Convert to milliseconds
     
+    // Stop profiling if enabled
+    if (enableProfiling && captureManager) {
+        [captureManager stopCapture];
+    }
     
     bool correct = true;
     float tolerance = 1e-5f;
@@ -452,13 +485,19 @@ void test_matmul() {
         if (fabs(C[i] - C_ref[i]) > tolerance) {
             NSLog(@"Mismatch at index %d: GPU=%.6f, CPU=%.6f", i, C[i], C_ref[i]);
             correct = false;
+            break;
         }
     }
     
     NSLog(@"Performance Results:");
+    NSLog(@"(%d x %d) * (%d x %d) = (%d x %d):", m, k, k, n, m, n);
     NSLog(@"CPU Time: %.3f ms", cpuTime);
     NSLog(@"GPU Time: %.3f ms", gpuTime);
     NSLog(@"Speedup: %.2fx", cpuTime / gpuTime);
+    
+    double gflop_calced = 2.0*m*k*n / 1e9;
+    NSLog(@"GFLOPS: %.2f", 1000 * gflop_calced / gpuTime);
+    
     
     if (correct) {
         NSLog(@"✅ Matrix multiplication test PASSED!");
@@ -469,8 +508,15 @@ void test_matmul() {
     free(C_ref);
 }
 
+void test_matmul(){
+    int N = 1000;
+    test_matmul_with_profiling(false,N ,N , N);
+    
+}
+
 int main(int argc, const char * argv[]) {
     @autoreleasepool {
+       // runloopkernel_single_encoder(5);
         test_matmul();
     }
     return 0;
